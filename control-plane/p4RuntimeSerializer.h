@@ -18,6 +18,9 @@ limitations under the License.
 #define CONTROL_PLANE_P4RUNTIMESERIALIZER_H_
 
 #include <iosfwd>
+#include <unordered_map>
+
+#include "lib/cstring.h"
 
 namespace p4 {
 namespace config {
@@ -59,6 +62,24 @@ struct P4RuntimeAPI {
     const p4::WriteRequest* entries;
 };
 
+class P4RuntimeArchHandlerBuilder;
+
+class P4RuntimeSerializer {
+ public:
+    static P4RuntimeSerializer* get();
+
+    void registerArch(const cstring archName, const P4RuntimeArchHandlerBuilder* builder);
+
+    P4RuntimeAPI generateP4Runtime(const IR::P4Program* program);
+
+    void serializeP4RuntimeIfRequired(const IR::P4Program* program,
+                                      const CompilerOptions& options); 
+ private:
+    P4RuntimeSerializer() = default;
+
+    std::unordered_map<cstring, const P4RuntimeArchHandlerBuilder*> archHandlerBuilders{};
+};
+
 /**
  * Generate a P4Runtime control-plane API for the provided program.
  *
@@ -82,7 +103,7 @@ P4RuntimeAPI generateP4Runtime(const IR::P4Program* program);
  * @param options  The command-line options used to invoke the compiler.
  */
 void serializeP4RuntimeIfRequired(const IR::P4Program* program,
-                                  const CompilerOptions& options);
+                                  const CompilerOptions& options); 
 
 }  // namespace P4
 
