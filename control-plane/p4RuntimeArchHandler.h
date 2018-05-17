@@ -17,12 +17,15 @@ limitations under the License.
 #ifndef CONTROL_PLANE_P4RUNTIMEARCHHANDLER_H_
 #define CONTROL_PLANE_P4RUNTIMEARCHHANDLER_H_
 
+#include <set>
+
 #include <boost/optional.hpp>
 
 #include "p4/config/p4info.pb.h"
 
 #include "frontends/p4/methodInstance.h"
 #include "ir/ir.h"
+#include "lib/ordered_set.h"
 
 namespace P4 {
 
@@ -119,8 +122,7 @@ class P4RuntimeArchHandlerIface {
                                    const P4::ExternFunction* externFunction) = 0;
 };
 
-class P4RuntimeArchHandlerBuilder {
- public:
+struct P4RuntimeArchHandlerBuilder {
     virtual ~P4RuntimeArchHandlerBuilder() { }
 
     virtual P4RuntimeArchHandlerIface* operator()(
@@ -128,14 +130,191 @@ class P4RuntimeArchHandlerBuilder {
         TypeMap* typeMap) const = 0;
 };
 
+namespace Helpers {
+
 /// @return an extern instance defined or referenced by the value of @table's
 /// @propertyName property, or boost::none if no extern was referenced.
-static boost::optional<ExternInstance>
+boost::optional<ExternInstance>
 getExternInstanceFromProperty(const IR::P4Table* table,
                               const cstring& propertyName,
                               ReferenceMap* refMap,
                               TypeMap* typeMap,
                               bool *isConstructedInPlace = nullptr);
+
+/// Visit evaluated blocks under the provided top-level block. Guarantees that
+/// each block is visited only once, even if multiple paths to reach it exist.
+template <typename Func>
+void forAllEvaluatedBlocks(const IR::ToplevelBlock* aToplevelBlock, Func function) {
+    std::set<const IR::Block*> visited;
+    ordered_set<const IR::Block*> frontier{aToplevelBlock};
+
+    while (!frontier.empty()) {
+        // Pop a block off the frontier of blocks we haven't yet visited.
+        auto evaluatedBlock = *frontier.begin();
+        frontier.erase(frontier.begin());
+        visited.insert(evaluatedBlock);
+
+        function(evaluatedBlock);
+
+        // Add child blocks to the frontier if we haven't already visited them.
+        for (auto evaluatedChild : evaluatedBlock->constantValue) {
+            if (!evaluatedChild.second->is<IR::Block>()) continue;
+            auto evaluatedChildBlock = evaluatedChild.second->to<IR::Block>();
+            if (visited.find(evaluatedChildBlock) != visited.end()) continue;
+            frontier.insert(evaluatedChildBlock);
+        }
+    }
+}
+
+/// Serialize @annotated's P4 annotations and attach them to a P4Info message
+/// with an 'annotations' field. '@name' and '@id' are ignored, as well as
+/// annotations whose name satisfies predicate @p.
+template <typename Message, typename UnaryPredicate>
+void addAnnotations(Message* message, const IR::IAnnotated* annotated, UnaryPredicate p) {
+    CHECK_NULL(message);
+
+    // Synthesized resources may have no annotations.
+    if (annotated == nullptr) return;
+
+    for (const IR::Annotation* annotation : annotated->getAnnotations()->annotations) {
+        // Don't output the @name or @id annotations; they're represented
+        // elsewhere in P4Info messages.
+        if (annotation->name == IR::Annotation::nameAnnotation) continue;
+        if (annotation->name == "id") continue;
+        if (p(annotation->name)) continue;
+
+        // Serialize the annotation.
+        // XXX(seth): Might be nice to do something better than rely on toString().
+        std::string serializedAnnotation = "@" + annotation->name + "(";
+        auto expressions = annotation->expr;
+        for (unsigned i = 0; i < expressions.size(); ++i) {
+            serializedAnnotation.append(expressions[i]->toString());
+            if (i + 1 < expressions.size()) serializedAnnotation.append(", ");
+        }
+        serializedAnnotation.append(")");
+
+        message->add_annotations(serializedAnnotation);
+    }
+}
+
+/// calls addAnnotations with a unconditionally false predicate.
+template <typename Message>
+void addAnnotations(Message* message, const IR::IAnnotated* annotated) {
+    addAnnotations(message, annotated, [](cstring){ return false; });
+}
+
+/// @return @table's size property if available, falling back to the
+/// architecture's default size.
+int64_t getTableSize(const IR::P4Table* table);
+
+/// A traits class describing the properties of "counterlike" things.
+template <typename Kind> struct CounterlikeTraits;
+
+/**
+ * The information about a counter or meter instance which is necessary to
+ * serialize it. @Kind must be a class with a CounterlikeTraits<>
+ * specialization.
+ */
+template <typename Kind>
+struct Counterlike {
+    /// The name of the instance.
+    const cstring name;
+    /// If non-null, the instance's annotations.
+    const IR::IAnnotated* annotations;
+    /// The units parameter to the instance; valid values vary depending on @Kind.
+    const cstring unit;
+    /// The size parameter to the instance.
+    const int64_t size;
+    /// If not none, the instance is a direct resource associated with @table.
+    const boost::optional<cstring> table;
+
+    /// @return the information required to serialize an explicit @instance of
+    /// @Kind, which is defined inside a control block.
+    static boost::optional<Counterlike<Kind>>
+    from(const IR::ExternBlock* instance) {
+        CHECK_NULL(instance);
+        auto declaration = instance->node->to<IR::IDeclaration>();
+
+        // Counter and meter externs refer to their unit as a "type"; this is
+        // (confusingly) unrelated to the "type" field of a counter or meter in
+        // P4Info.
+        auto unit = instance->getParameterValue("type");
+        if (!unit->is<IR::Declaration_ID>()) {
+            ::error("%1% '%2%' has a unit type which is not an enum constant: %3%",
+                    CounterlikeTraits<Kind>::name(), declaration, unit);
+            return boost::none;
+        }
+
+        auto size = instance->getParameterValue("size")->to<IR::Constant>();
+        if (!size->is<IR::Constant>()) {
+            ::error("%1% '%2%' has a non-constant size: %3%",
+                    CounterlikeTraits<Kind>::name(), declaration, size);
+            return boost::none;
+        }
+
+        return Counterlike<Kind>{declaration->controlPlaneName(),
+                                 declaration->to<IR::IAnnotated>(),
+                                 unit->to<IR::Declaration_ID>()->name,
+                                 size->to<IR::Constant>()->value.get_si(),
+                                 boost::none};
+    }
+
+    /// @return the information required to serialize an @instance of @Kind which
+    /// is either defined in or referenced by a property value of @table. (This
+    /// implies that @instance is a direct resource of @table.)
+    static boost::optional<Counterlike<Kind>>
+    fromDirect(const ExternInstance& instance, const IR::P4Table* table) {
+        CHECK_NULL(table);
+        BUG_CHECK(instance.name != boost::none,
+                  "Caller should've ensured we have a name");
+
+        if (instance.type->name != CounterlikeTraits<Kind>::directTypeName()) {
+            ::error("Expected a direct %1%: %2%", CounterlikeTraits<Kind>::name(),
+                    instance.expression);
+            return boost::none;
+        }
+
+        auto unitArgument = instance.arguments->at(0)->expression;
+        if (unitArgument == nullptr) {
+            ::error("Direct %1% instance %2% should take a constructor argument",
+                    CounterlikeTraits<Kind>::name(), instance.expression);
+            return boost::none;
+        }
+        if (!unitArgument->is<IR::Member>()) {
+            ::error("Direct %1% instance %2% has an unexpected constructor argument",
+                    CounterlikeTraits<Kind>::name(), instance.expression);
+            return boost::none;
+        }
+
+        auto unit = unitArgument->to<IR::Member>()->member.name;
+        return Counterlike<Kind>{*instance.name, instance.annotations,
+                                 unit, Helpers::getTableSize(table),
+                                 table->controlPlaneName()};
+    }
+};
+
+/// @return the direct counter associated with @table, if it has one, or
+/// boost::none otherwise.
+template <typename Kind>
+boost::optional<Counterlike<Kind>>
+getDirectCounterlike(const IR::P4Table* table, ReferenceMap* refMap, TypeMap* typeMap) {
+    auto propertyName = CounterlikeTraits<Kind>::directPropertyName();
+    auto instance =
+      getExternInstanceFromProperty(table, propertyName, refMap, typeMap);
+    if (!instance) return boost::none;
+    return Counterlike<Kind>::fromDirect(*instance, table);
+}
+
+}  // namespace Helpers
+
+namespace Standard {
+
+struct V1ModelArchHandlerBuilder : public P4RuntimeArchHandlerBuilder {
+    P4RuntimeArchHandlerIface* operator()(
+        ReferenceMap* refMap, TypeMap* typeMap) const override;
+};
+
+}  // namespace Standard
 
 }  // namespace ControlPlaneAPI
 

@@ -17,6 +17,7 @@ limitations under the License.
 #include <boost/optional.hpp>
 
 #include "frontends/common/resolveReferences/referenceMap.h"
+#include "frontends/p4/fromv1.0/v1model.h"
 #include "frontends/p4/externInstance.h"
 #include "frontends/p4/typeMap.h"
 #include "ir/ir.h"
@@ -27,7 +28,9 @@ namespace P4 {
 
 namespace ControlPlaneAPI {
 
-static boost::optional<ExternInstance>
+namespace Helpers {
+
+boost::optional<ExternInstance>
 getExternInstanceFromProperty(const IR::P4Table* table,
                               const cstring& propertyName,
                               ReferenceMap* refMap,
@@ -60,6 +63,33 @@ getExternInstanceFromProperty(const IR::P4Table* table,
 
     return externInstance;
 }
+
+/// @return @table's size property if available, falling back to the default size.
+int64_t getTableSize(const IR::P4Table* table) {
+    const int64_t defaultTableSize =
+        P4V1::V1Model::instance.tableAttributes.defaultTableSize;
+
+    auto sizeProperty = table->properties->getProperty("size");
+    if (sizeProperty == nullptr) {
+        return defaultTableSize;
+    }
+
+    if (!sizeProperty->value->is<IR::ExpressionValue>()) {
+        ::error("Expected an expression for table size property: %1%", sizeProperty);
+        return defaultTableSize;
+    }
+
+    auto expression = sizeProperty->value->to<IR::ExpressionValue>()->expression;
+    if (!expression->is<IR::Constant>()) {
+        ::error("Expected a constant for table size property: %1%", sizeProperty);
+        return defaultTableSize;
+    }
+
+    const int64_t tableSize = expression->to<IR::Constant>()->asInt();
+    return tableSize == 0 ? defaultTableSize : tableSize;
+}
+
+}  // namespace Helpers
 
 }  // namespace ControlPlaneAPI
 

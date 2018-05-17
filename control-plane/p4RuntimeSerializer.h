@@ -62,22 +62,26 @@ struct P4RuntimeAPI {
     const p4::WriteRequest* entries;
 };
 
-class P4RuntimeArchHandlerBuilder;
+namespace ControlPlaneAPI {
+struct P4RuntimeArchHandlerBuilder;
+}  // namespace ControlPlaneAPI
 
 class P4RuntimeSerializer {
  public:
     static P4RuntimeSerializer* get();
 
-    void registerArch(const cstring archName, const P4RuntimeArchHandlerBuilder* builder);
+    void registerArch(const cstring archName,
+                      const ControlPlaneAPI::P4RuntimeArchHandlerBuilder* builder);
 
-    P4RuntimeAPI generateP4Runtime(const IR::P4Program* program);
+    P4RuntimeAPI generateP4Runtime(const IR::P4Program* program, cstring arch);
 
     void serializeP4RuntimeIfRequired(const IR::P4Program* program,
                                       const CompilerOptions& options); 
  private:
-    P4RuntimeSerializer() = default;
+    P4RuntimeSerializer();
 
-    std::unordered_map<cstring, const P4RuntimeArchHandlerBuilder*> archHandlerBuilders{};
+    std::unordered_map<cstring, const ControlPlaneAPI::P4RuntimeArchHandlerBuilder*>
+    archHandlerBuilders{};
 };
 
 /**
@@ -91,7 +95,7 @@ class P4RuntimeSerializer {
  *                 frontend passes must have already run.
  * @return the generated P4Runtime API.
  */
-P4RuntimeAPI generateP4Runtime(const IR::P4Program* program);
+P4RuntimeAPI generateP4Runtime(const IR::P4Program* program, cstring arch = "v1model");
 
 /**
  * A convenience wrapper for P4::generateP4Runtime() which generates the
