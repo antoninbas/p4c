@@ -779,10 +779,131 @@ class P4RuntimeSymbolTable : public P4RuntimeSymbolTableIface {
     P4SymbolSuffixSet suffixSet;
 };
 
+/// @return the table implementation property, or nullptr if the table has no
+/// such property.
+static const IR::Property *
+getTableImplementationProperty(const IR::P4Table* table) {
+    return table->properties->getProperty(
+        P4V1::V1Model::instance.tableAttributes.tableImplementation.name);
+}
+
+static const IR::IAnnotated*
+getTableImplementationAnnotations(const IR::P4Table* table, ReferenceMap* refMap) {
+    auto impl = getTableImplementationProperty(table);
+    if (impl == nullptr) return nullptr;
+    if (!impl->value->is<IR::ExpressionValue>()) return nullptr;
+    auto expr = impl->value->to<IR::ExpressionValue>()->expression;
+    if (expr->is<IR::ConstructorCallExpression>()) return impl->to<IR::IAnnotated>();
+    if (expr->is<IR::PathExpression>()) {
+        auto decl = refMap->getDeclaration(expr->to<IR::PathExpression>()->path, true);
+        return decl->to<IR::IAnnotated>();
+    }
+    return nullptr;
+}
+
+/// Serialize @annotated's P4 annotations and attach them to a P4Info message
+/// with an 'annotations' field. '@name' and '@id' are ignored, as well as
+/// annotations whose name satisfies predicate @p.
+template <typename Message, typename UnaryPredicate>
+static void addAnnotations(Message* message, const IR::IAnnotated* annotated,
+                           UnaryPredicate p) {
+    CHECK_NULL(message);
+
+    // Synthesized resources may have no annotations.
+    if (annotated == nullptr) return;
+
+    for (const IR::Annotation* annotation : annotated->getAnnotations()->annotations) {
+        // Don't output the @name or @id annotations; they're represented
+        // elsewhere in P4Info messages.
+        if (annotation->name == IR::Annotation::nameAnnotation) continue;
+        if (annotation->name == "id") continue;
+        if (p(annotation->name)) continue;
+
+        // Serialize the annotation.
+        // XXX(seth): Might be nice to do something better than rely on toString().
+        std::string serializedAnnotation = "@" + annotation->name + "(";
+        auto expressions = annotation->expr;
+        for (unsigned i = 0; i < expressions.size(); ++i) {
+            serializedAnnotation.append(expressions[i]->toString());
+            if (i + 1 < expressions.size()) serializedAnnotation.append(", ");
+        }
+        serializedAnnotation.append(")");
+
+        message->add_annotations(serializedAnnotation);
+    }
+}
+
+/// Visit evaluated blocks under the provided top-level block. Guarantees that
+/// each block is visited only once, even if multiple paths to reach it exist.
+template <typename Func>
+static void forAllEvaluatedBlocks(const IR::ToplevelBlock* aToplevelBlock,
+                                  Func function) {
+    std::set<const IR::Block*> visited;
+    ordered_set<const IR::Block*> frontier{aToplevelBlock};
+
+    while (!frontier.empty()) {
+        // Pop a block off the frontier of blocks we haven't yet visited.
+        auto evaluatedBlock = *frontier.begin();
+        frontier.erase(frontier.begin());
+        visited.insert(evaluatedBlock);
+
+        function(evaluatedBlock);
+
+        // Add child blocks to the frontier if we haven't already visited them.
+        for (auto evaluatedChild : evaluatedBlock->constantValue) {
+            if (!evaluatedChild.second->is<IR::Block>()) continue;
+            auto evaluatedChildBlock = evaluatedChild.second->to<IR::Block>();
+            if (visited.find(evaluatedChildBlock) != visited.end()) continue;
+            frontier.insert(evaluatedChildBlock);
+        }
+    }
+}
+
+/// calls addAnnotations with a unconditionally false predicate.
+template <typename Message>
+static void addAnnotations(Message* message, const IR::IAnnotated* annotated) {
+    addAnnotations(message, annotated, [](cstring){ return false; });
+}
+
 namespace Standard {
+
+static boost::optional<cstring>
+getTableImplementationName(const IR::P4Table* table, ReferenceMap* refMap) {
+    auto impl = getTableImplementationProperty(table);
+    if (impl == nullptr) return boost::none;
+    if (!impl->value->is<IR::ExpressionValue>()) {
+        ::error("Expected implementation property value for table %1% to be an expression: %2%",
+                table->controlPlaneName(), impl);
+        return boost::none;
+    }
+    auto expr = impl->value->to<IR::ExpressionValue>()->expression;
+    if (expr->is<IR::ConstructorCallExpression>()) return impl->controlPlaneName();
+    if (expr->is<IR::PathExpression>()) {
+        auto decl = refMap->getDeclaration(expr->to<IR::PathExpression>()->path, true);
+        return decl->controlPlaneName();
+    }
+    return boost::none;
+}
+
+/// @return the direct counter associated with @table, if it has one, or
+/// boost::none otherwise.
+template <typename Kind>
+static boost::optional<Counterlike<Kind>>
+getDirectCounterlike(const IR::P4Table* table, ReferenceMap* refMap, TypeMap* typeMap) {
+    auto propertyName = CounterlikeTraits<Kind>::directPropertyName();
+    auto instance =
+      getExternInstanceFromProperty(table, propertyName, refMap, typeMap);
+    if (!instance) return boost::none;
+    return Counterlike<Kind>::fromDirect(*instance, table);
+}
 
 class P4RuntimeArchHandlerV1Model : public P4RuntimeArchHandlerIface {
  public:
+    using Counter = ::p4::config::Counter;
+    using Meter = ::p4::config::Meter;
+    using CounterSpec = ::p4::config::CounterSpec;
+    using MeterSpec = ::p4::config::MeterSpec;
+
     P4RuntimeArchHandlerV1Model(ReferenceMap* refMap,TypeMap* typeMap)
         : refMap(refMap), typeMap(typeMap) { }
 
@@ -870,23 +991,89 @@ class P4RuntimeArchHandlerV1Model : public P4RuntimeArchHandlerIface {
         if (digest) symbols->add(P4RuntimeSymbolType_Standard::DIGEST(), digest->name);
     }
 
+    void postCollect(const P4RuntimeSymbolTableIface& symbols,
+                     const IR::ToplevelBlock* aToplevelBlock) override {
+        (void)symbols;
+        // analyze action profiles and build a mapping from action profile name to the set of tables
+        // referencing them
+        forAllEvaluatedBlocks(aToplevelBlock, [&](const IR::Block* block) {
+            if (!block->is<IR::TableBlock>()) return;
+            auto table = block->to<IR::TableBlock>()->container;
+            auto implementation = getTableImplementationName(table, refMap);
+            if (implementation)
+                actionProfilesRefs[*implementation].insert(table->controlPlaneName());
+        });
+    }
+
     void addTableProperties(const P4RuntimeSymbolTableIface& symbols,
                             p4::config::P4Info* p4info,
                             p4::config::Table* table,
                             const IR::TableBlock* tableBlock) override {
+        CHECK_NULL(tableBlock);
+        auto tableDeclaration = tableBlock->container;
 
+        auto implementation = getActionProfile(tableDeclaration, refMap, typeMap);
+        auto directCounter = getDirectCounterlike<IR::Counter>(tableDeclaration, refMap, typeMap);
+        auto directMeter = getDirectCounterlike<IR::Meter>(tableDeclaration, refMap, typeMap);
+        bool supportsTimeout = getSupportsTimeout(tableDeclaration);
+
+        if (implementation) {
+            auto id = symbols.getId(P4RuntimeSymbolType_Standard::ACTION_PROFILE(),
+                                    implementation->name);
+            table->set_implementation_id(id);
+            addActionProfile(symbols, p4info, *implementation);
+        }
+
+        if (directCounter) {
+            auto id = symbols.getId(P4RuntimeSymbolType_Standard::DIRECT_COUNTER(),
+                                    directCounter->name);
+            table->add_direct_resource_ids(id);
+            addCounter(symbols, p4info, *directCounter);
+        }
+
+        if (directMeter) {
+            auto id = symbols.getId(P4RuntimeSymbolType_Standard::DIRECT_METER(),
+                                    directMeter->name);
+            table->add_direct_resource_ids(id);
+            addMeter(symbols, p4info, *directMeter);
+        }
+
+        if (supportsTimeout) {
+            table->set_idle_timeout_behavior(p4::config::Table::NOTIFY_CONTROL);
+        } else {
+            table->set_idle_timeout_behavior(p4::config::Table::NO_TIMEOUT);
+        }
     }
 
     void addExternInstance(const P4RuntimeSymbolTableIface& symbols,
                            p4::config::P4Info* p4info,
                            const IR::ExternBlock* externBlock) override {
+        auto decl = externBlock->node->to<IR::Declaration_Instance>();
+        if (decl == nullptr) return;
 
+        auto p4RtTypeInfo = p4info->mutable_type_info();
+        if (externBlock->type->name == CounterlikeTraits<IR::Counter>::typeName()) {
+            auto counter = Counterlike<IR::Counter>::from(externBlock);
+            if (counter) addCounter(symbols, p4info, *counter);
+        } else if (externBlock->type->name == CounterlikeTraits<IR::Meter>::typeName()) {
+            auto meter = Counterlike<IR::Meter>::from(externBlock);
+            if (meter) addMeter(symbols, p4info, *meter);
+        } else if (externBlock->type->name == P4V1::V1Model::instance.registers.name) {
+            auto register_ = Register::from(externBlock, refMap, typeMap, p4RtTypeInfo);
+            if (register_) addRegister(symbols, p4info, *register_);
+        } else if (externBlock->type->name == P4V1::V1Model::instance.action_profile.name ||
+                   externBlock->type->name == P4V1::V1Model::instance.action_selector.name) {
+            auto actionProfile = getActionProfile(decl, externBlock->type);
+            if (actionProfile) addActionProfile(symbols, p4info, *actionProfile);
+        }
     }
 
     void addExternFunction(const P4RuntimeSymbolTableIface& symbols,
                            p4::config::P4Info* p4info,
                            const P4::ExternFunction* externFunction) override {
-
+        auto p4RtTypeInfo = p4info->mutable_type_info();
+        auto digest = getDigestCall(externFunction, refMap, typeMap, p4RtTypeInfo);
+        if (digest) addDigest(symbols, p4info, *digest);
     }
 
     /// @return serialization information for the digest() call represented by
@@ -938,28 +1125,355 @@ class P4RuntimeArchHandlerV1Model : public P4RuntimeArchHandlerIface {
         return Digest{controlPlaneName, typeSpec};
     }
 
+    void addDigest(const P4RuntimeSymbolTableIface& symbols,
+                   p4::config::P4Info* p4Info,
+                   const Digest& digest) {
+        // Each call to digest() creates a new digest entry in the P4Info.
+        // Right now we only take the type of data included in the digest
+        // (encoded in its name) into account, but it may be that we should also
+        // consider the receiver.
+        auto id = symbols.getId(P4RuntimeSymbolType_Standard::DIGEST(), digest.name);
+        if (serializedInstances.find(id) != serializedInstances.end()) return;
+        serializedInstances.insert(id);
+
+        auto* digestInstance = p4Info->add_digests();
+        digestInstance->mutable_preamble()->set_id(id);
+        digestInstance->mutable_preamble()->set_name(digest.name);
+        digestInstance->mutable_preamble()->set_alias(symbols.getAlias(digest.name));
+        digestInstance->mutable_type_spec()->CopyFrom(*digest.typeSpec);
+    }
+
+    static boost::optional<ActionProfile>
+    getActionProfile(cstring name,
+                     const IR::Type_Extern* type,
+                     const IR::Vector<IR::Argument>* arguments,
+                     const IR::IAnnotated* annotations) {
+        ActionProfileType actionProfileType;
+        const IR::Expression* sizeExpression;
+        if (type->name == P4V1::V1Model::instance.action_selector.name) {
+            actionProfileType = ActionProfileType::INDIRECT_WITH_SELECTOR;
+            sizeExpression = arguments->at(1)->expression;
+        } else if (type->name == P4V1::V1Model::instance.action_profile.name) {
+            actionProfileType = ActionProfileType::INDIRECT;
+            sizeExpression = arguments->at(0)->expression;
+        } else {
+            return boost::none;
+        }
+
+        if (!sizeExpression->is<IR::Constant>()) {
+            ::error("Action profile '%1%' has non-constant size '%1%'",
+                    name, sizeExpression);
+            return boost::none;
+        }
+
+        const int64_t size = sizeExpression->to<IR::Constant>()->asInt();
+        return ActionProfile{name, actionProfileType, size, annotations};
+    }
+
+    /// @return the action profile referenced in @table's implementation property,
+    /// if it has one, or boost::none otherwise.
+    static boost::optional<ActionProfile>
+    getActionProfile(const IR::P4Table* table, ReferenceMap* refMap, TypeMap* typeMap) {
+        auto propertyName = P4V1::V1Model::instance.tableAttributes.tableImplementation.name;
+        auto instance =
+            getExternInstanceFromProperty(table, propertyName, refMap, typeMap);
+        if (!instance) return boost::none;
+        return getActionProfile(*instance->name, instance->type, instance->arguments,
+                                getTableImplementationAnnotations(table, refMap));
+    }
+
+    static boost::optional<ActionProfile>
+    getActionProfile(const IR::Declaration_Instance* decl, const IR::Type_Extern* type) {
+        return getActionProfile(decl->controlPlaneName(), type, decl->arguments,
+                                decl->to<IR::IAnnotated>());
+    }
+
+    /// @return true if @table's 'support_timeout' property exists and is true. This
+    /// indicates that @table supports entry ageing.
+    static bool getSupportsTimeout(const IR::P4Table* table) {
+        auto timeout = table->properties->getProperty(P4V1::V1Model::instance
+                                                      .tableAttributes
+                                                      .supportTimeout.name);
+        if (timeout == nullptr) return false;
+        if (!timeout->value->is<IR::ExpressionValue>()) {
+            ::error("Unexpected value %1% for supports_timeout on table %2%",
+                    timeout, table);
+            return false;
+        }
+
+        auto expr = timeout->value->to<IR::ExpressionValue>()->expression;
+        if (!expr->is<IR::BoolLiteral>()) {
+            ::error("Unexpected non-boolean value %1% for supports_timeout "
+                    "property on table %2%", timeout, table);
+            return false;
+        }
+
+        return expr->to<IR::BoolLiteral>()->value;
+    }
+
+    /// Set common fields between p4::config::Counter and p4::config::DirectCounter.
+    template <typename Kind>
+    void setCounterCommon(const P4RuntimeSymbolTableIface& symbols, Kind *counter,
+                          const Counterlike<IR::Counter>& counterInstance) {
+        counter->mutable_preamble()->set_name(counterInstance.name);
+        counter->mutable_preamble()->set_alias(symbols.getAlias(counterInstance.name));
+        addAnnotations(counter->mutable_preamble(), counterInstance.annotations);
+        auto counter_spec = counter->mutable_spec();
+
+        if (counterInstance.unit == "packets") {
+            counter_spec->set_unit(CounterSpec::PACKETS);
+        } else if (counterInstance.unit == "bytes") {
+            counter_spec->set_unit(CounterSpec::BYTES);
+        } else if (counterInstance.unit == "packets_and_bytes") {
+            counter_spec->set_unit(CounterSpec::BOTH);
+        } else {
+            counter_spec->set_unit(CounterSpec::UNSPECIFIED);
+        }
+    }
+
+    void addCounter(const P4RuntimeSymbolTableIface& symbols,
+                    p4::config::P4Info* p4Info,
+                    const Counterlike<IR::Counter>& counterInstance) {
+        if (counterInstance.table) {
+            auto counter = p4Info->add_direct_counters();
+            auto id = symbols.getId(P4RuntimeSymbolType_Standard::DIRECT_COUNTER(),
+                                    counterInstance.name);
+            counter->mutable_preamble()->set_id(id);
+            setCounterCommon(symbols, counter, counterInstance);
+            auto tableId = symbols.getId(P4RuntimeSymbolType::TABLE(), *counterInstance.table);
+            counter->set_direct_table_id(tableId);
+        } else {
+            auto counter = p4Info->add_counters();
+            auto id = symbols.getId(P4RuntimeSymbolType_Standard::COUNTER(),
+                                    counterInstance.name);
+            counter->mutable_preamble()->set_id(id);
+            setCounterCommon(symbols, counter, counterInstance);
+            counter->set_size(counterInstance.size);
+        }
+    }
+
+    /// Set common fields between p4::config::Meter and p4::config::DirectMeter.
+    template <typename Kind>
+    void setMeterCommon(const P4RuntimeSymbolTableIface& symbols, Kind *meter,
+                        const Counterlike<IR::Meter>& meterInstance) {
+        meter->mutable_preamble()->set_name(meterInstance.name);
+        meter->mutable_preamble()->set_alias(symbols.getAlias(meterInstance.name));
+        addAnnotations(meter->mutable_preamble(), meterInstance.annotations);
+        auto meter_spec = meter->mutable_spec();
+        meter_spec->set_type(MeterSpec::COLOR_UNAWARE);  // A default; this isn't exposed.
+
+        if (meterInstance.unit == "packets") {
+            meter_spec->set_unit(MeterSpec::PACKETS);
+        } else if (meterInstance.unit == "bytes") {
+            meter_spec->set_unit(MeterSpec::BYTES);
+        } else {
+            meter_spec->set_unit(MeterSpec::UNSPECIFIED);
+        }
+    }
+
+    void addMeter(const P4RuntimeSymbolTableIface& symbols,
+                  p4::config::P4Info* p4Info,
+                  const Counterlike<IR::Meter>& meterInstance) {
+        if (meterInstance.table) {
+            auto meter = p4Info->add_direct_meters();
+            auto id = symbols.getId(P4RuntimeSymbolType_Standard::DIRECT_METER(),
+                                    meterInstance.name);
+            meter->mutable_preamble()->set_id(id);
+            setMeterCommon(symbols, meter, meterInstance);
+            auto tableId = symbols.getId(P4RuntimeSymbolType::TABLE(), *meterInstance.table);
+            meter->set_direct_table_id(tableId);
+        } else {
+            auto meter = p4Info->add_meters();
+            auto id = symbols.getId(P4RuntimeSymbolType_Standard::METER(),
+                                    meterInstance.name);
+            meter->mutable_preamble()->set_id(id);
+            setMeterCommon(symbols, meter, meterInstance);
+            meter->set_size(meterInstance.size);
+        }
+    }
+
+    void addRegister(const P4RuntimeSymbolTableIface& symbols,
+                     p4::config::P4Info* p4Info,
+                     const Register& registerInstance) {
+        auto register_ = p4Info->add_registers();
+        auto id = symbols.getId(P4RuntimeSymbolType_Standard::REGISTER(),
+                                registerInstance.name);
+        register_->mutable_preamble()->set_id(id);
+        register_->mutable_preamble()->set_name(registerInstance.name);
+        register_->mutable_preamble()->set_alias(symbols.getAlias(registerInstance.name));
+        addAnnotations(register_->mutable_preamble(), registerInstance.annotations);
+        register_->set_size(registerInstance.size);
+        register_->mutable_type_spec()->CopyFrom(*registerInstance.typeSpec);
+    }
+
+    void addActionProfile(const P4RuntimeSymbolTableIface& symbols,
+                          p4::config::P4Info* p4Info,
+                          const ActionProfile& actionProfile) {
+        auto profile = p4Info->add_action_profiles();
+        auto id = symbols.getId(P4RuntimeSymbolType_Standard::ACTION_PROFILE(),
+                                actionProfile.name);
+        profile->mutable_preamble()->set_id(id);
+        profile->mutable_preamble()->set_name(actionProfile.name);
+        profile->mutable_preamble()->set_alias(symbols.getAlias(actionProfile.name));
+        profile->set_with_selector(actionProfile.type
+                                     == ActionProfileType::INDIRECT_WITH_SELECTOR);
+        profile->set_size(actionProfile.size);
+
+        auto tablesIt = actionProfilesRefs.find(actionProfile.name);
+        if (tablesIt != actionProfilesRefs.end()) {
+            for (const auto& table : tablesIt->second)
+                profile->add_table_ids(symbols.getId(P4RuntimeSymbolType::TABLE(), table));
+        }
+
+        addAnnotations(profile->mutable_preamble(), actionProfile.annotations);
+    }
+
  private:
     ReferenceMap* refMap;
     TypeMap* typeMap;
+
+    std::unordered_map<cstring, std::set<cstring> > actionProfilesRefs;
+
+    /// The extern instances we've serialized so far. Used for deduplication.
+    std::set<p4rt_id_t> serializedInstances;
 };
 
 }  // namespace Standard
 
+/// @return @table's default action, if it has one, or boost::none otherwise.
+static boost::optional<DefaultAction>
+getDefaultAction(const IR::P4Table* table, ReferenceMap* refMap, TypeMap* typeMap) {
+    auto defaultActionProperty =
+        table->properties->getProperty(IR::TableProperties::defaultActionPropertyName);
+    if (defaultActionProperty == nullptr) return boost::none;
+    if (!defaultActionProperty->value->is<IR::ExpressionValue>()) {
+        ::error("Expected an action: %1%", defaultActionProperty);
+        return boost::none;
+    }
+
+    auto expr =
+        defaultActionProperty->value->to<IR::ExpressionValue>()->expression;
+    cstring actionName;
+    if (expr->is<IR::PathExpression>()) {
+        auto decl = refMap->getDeclaration(expr->to<IR::PathExpression>()->path, true);
+        BUG_CHECK(decl->is<IR::P4Action>(), "Expected an action: %1%", expr);
+        actionName = decl->to<IR::P4Action>()->controlPlaneName();
+    } else if (expr->is<IR::MethodCallExpression>()) {
+        auto callExpr = expr->to<IR::MethodCallExpression>();
+        auto instance = P4::MethodInstance::resolve(callExpr, refMap, typeMap);
+        BUG_CHECK(instance->is<P4::ActionCall>(), "Expected an action: %1%", expr);
+        actionName = instance->to<P4::ActionCall>()->action->controlPlaneName();
+    } else {
+        ::error("Unexpected expression in default action for table %1%: %2%",
+                table->controlPlaneName(), expr);
+        return boost::none;
+    }
+
+    return DefaultAction{actionName, defaultActionProperty->isConstant};
+}
+
+/// @return true if @table has a 'entries' property. The property must be const
+/// as per the current P4_16 specification. The frontend already enforces that
+/// check but we perform the check again here in case the constraint is relaxed
+/// in the specification in the future.
+static bool getConstTable(const IR::P4Table* table) {
+    BUG_CHECK(table != nullptr, "Failed precondition for getConstTable");
+    auto ep = table->properties->getProperty(IR::TableProperties::entriesPropertyName);
+    if (ep == nullptr) return false;
+    BUG_CHECK(ep->value->is<IR::EntriesList>(), "Invalid 'entries' property");
+    if (!ep->isConstant)
+        ::error("%1%: P4Runtime only supports constant table initializers", ep);
+    return true;
+}
+
+static std::vector<ActionRef>
+getActionRefs(const IR::P4Table* table, ReferenceMap* refMap) {
+    std::vector<ActionRef> actions;
+    for (auto action : table->getActionList()->actionList) {
+        auto decl = refMap->getDeclaration(action->getPath(), true);
+        BUG_CHECK(decl->is<IR::P4Action>(), "Not an action: '%1%'", decl);
+        auto name = decl->to<IR::P4Action>()->controlPlaneName();
+        // get annotations on the reference in the action list, not on the action declaration
+        auto annotations = action->to<IR::IAnnotated>();
+        actions.push_back(ActionRef{name, annotations});
+    }
+    return actions;
+}
+
+/// @return the header instance fields matched against by @table's key. The
+/// fields are represented as a (fully qualified field name, match type) tuple.
+static std::vector<MatchField>
+getMatchFields(const IR::P4Table* table, ReferenceMap* refMap, TypeMap* typeMap) {
+    std::vector<MatchField> matchFields;
+
+    auto key = table->getKey();
+    if (!key) return matchFields;
+
+    for (auto keyElement : key->keyElements) {
+        auto matchTypeDecl = refMap->getDeclaration(keyElement->matchType->path, true)
+                                   ->to<IR::Declaration_ID>();
+        BUG_CHECK(matchTypeDecl != nullptr, "No declaration for match type '%1%'",
+                                            keyElement->matchType);
+        const auto matchTypeName = matchTypeDecl->name.name;
+
+        MatchField::MatchType matchType;
+        if (matchTypeName == P4CoreLibrary::instance.exactMatch.name) {
+            matchType = MatchField::MatchTypes::EXACT;
+        } else if (matchTypeName == P4CoreLibrary::instance.lpmMatch.name) {
+            matchType = MatchField::MatchTypes::LPM;
+        } else if (matchTypeName == P4CoreLibrary::instance.ternaryMatch.name) {
+            matchType = MatchField::MatchTypes::TERNARY;
+        } else if (matchTypeName == P4V1::V1Model::instance.rangeMatchType.name) {
+            matchType = MatchField::MatchTypes::RANGE;
+        } else if (matchTypeName == P4V1::V1Model::instance.selectorMatchType.name) {
+            // // This match type indicates that this table is using an action
+            // // profile. We serialize action profiles separately from the tables
+            // // themselves, so we don't need to record any information about this
+            // // key, but it's worth doing a sanity check that this table has an
+            // // implementation property - if it doesn't, analyzeActionProfiles()
+            // // will ignore it.
+            // auto impl = getTableImplementationProperty(table);
+            // BUG_CHECK(impl != nullptr, "Table '%1%' has match type 'selector' "
+            //                            "but no implementation property",
+            //           table->controlPlaneName());
+            continue;
+        } else {
+            ::error("Table '%1%': cannot represent match type '%2%' in P4Runtime",
+                    table->controlPlaneName(), matchTypeName);
+            break;
+        }
+
+        auto matchFieldName = explicitNameAnnotation(keyElement);
+        BUG_CHECK(bool(matchFieldName), "Table '%1%': Match field '%2%' has no "
+                  "@name annotation", table->controlPlaneName(),
+                  keyElement->expression);
+        auto* matchFieldType =
+          typeMap->getType(keyElement->expression->getNode(), true);
+        BUG_CHECK(matchFieldType != nullptr,
+                  "Couldn't determine type for key element %1%", keyElement);
+
+        matchFields.push_back(MatchField{*matchFieldName, matchType,
+                                         uint32_t(matchFieldType->width_bits()),
+                                         keyElement->to<IR::IAnnotated>()});
+    }
+
+    return matchFields;
+}
+
 /// An analyzer which translates the information available in the P4 IR into a
 /// representation of the control plane API which is consumed by P4Runtime.
 class P4RuntimeAnalyzer {
-    using Counter = ::p4::config::Counter;
-    using Meter = ::p4::config::Meter;
-    using CounterSpec = ::p4::config::CounterSpec;
-    using MeterSpec = ::p4::config::MeterSpec;
     using Preamble = ::p4::config::Preamble;
     using P4Info = ::p4::config::P4Info;
 
     P4RuntimeAnalyzer(const P4RuntimeSymbolTable& symbols,
-                      TypeMap* typeMap)
+                      TypeMap* typeMap, ReferenceMap* refMap,
+                      P4RuntimeArchHandlerIface* archHandler)
         : p4Info(new P4Info)
         , symbols(symbols)
-        , typeMap(typeMap) {
+        , typeMap(typeMap)
+        , refMap(refMap)
+        , archHandler(archHandler) {
         CHECK_NULL(typeMap);
     }
 
@@ -986,109 +1500,6 @@ class P4RuntimeAnalyzer {
                                 const IR::ToplevelBlock* evaluatedProgram,
                                 ReferenceMap* refMap,
                                 TypeMap* typeMap);
-
-    /// Set common fields between p4::config::Counter and p4::config::DirectCounter.
-    template <typename Kind>
-    void setCounterCommon(Kind *counter, const Counterlike<IR::Counter>& counterInstance) {
-        counter->mutable_preamble()->set_name(counterInstance.name);
-        counter->mutable_preamble()->set_alias(symbols.getAlias(counterInstance.name));
-        addAnnotations(counter->mutable_preamble(), counterInstance.annotations);
-        auto counter_spec = counter->mutable_spec();
-
-        if (counterInstance.unit == "packets") {
-            counter_spec->set_unit(CounterSpec::PACKETS);
-        } else if (counterInstance.unit == "bytes") {
-            counter_spec->set_unit(CounterSpec::BYTES);
-        } else if (counterInstance.unit == "packets_and_bytes") {
-            counter_spec->set_unit(CounterSpec::BOTH);
-        } else {
-            counter_spec->set_unit(CounterSpec::UNSPECIFIED);
-        }
-    }
-
-    void addCounter(const Counterlike<IR::Counter>& counterInstance) {
-        if (counterInstance.table) {
-            auto counter = p4Info->add_direct_counters();
-            auto id = symbols.getId(P4RuntimeSymbolType_Standard::DIRECT_COUNTER(),
-                                    counterInstance.name);
-            counter->mutable_preamble()->set_id(id);
-            setCounterCommon(counter, counterInstance);
-            auto tableId = symbols.getId(P4RuntimeSymbolType::TABLE(), *counterInstance.table);
-            counter->set_direct_table_id(tableId);
-        } else {
-            auto counter = p4Info->add_counters();
-            auto id = symbols.getId(P4RuntimeSymbolType_Standard::COUNTER(),
-                                    counterInstance.name);
-            counter->mutable_preamble()->set_id(id);
-            setCounterCommon(counter, counterInstance);
-            counter->set_size(counterInstance.size);
-        }
-    }
-
-    /// Set common fields between p4::config::Meter and p4::config::DirectMeter.
-    template <typename Kind>
-    void setMeterCommon(Kind *meter, const Counterlike<IR::Meter>& meterInstance) {
-        meter->mutable_preamble()->set_name(meterInstance.name);
-        meter->mutable_preamble()->set_alias(symbols.getAlias(meterInstance.name));
-        addAnnotations(meter->mutable_preamble(), meterInstance.annotations);
-        auto meter_spec = meter->mutable_spec();
-        meter_spec->set_type(MeterSpec::COLOR_UNAWARE);  // A default; this isn't exposed.
-
-        if (meterInstance.unit == "packets") {
-            meter_spec->set_unit(MeterSpec::PACKETS);
-        } else if (meterInstance.unit == "bytes") {
-            meter_spec->set_unit(MeterSpec::BYTES);
-        } else {
-            meter_spec->set_unit(MeterSpec::UNSPECIFIED);
-        }
-    }
-
-    void addMeter(const Counterlike<IR::Meter>& meterInstance) {
-        if (meterInstance.table) {
-            auto meter = p4Info->add_direct_meters();
-            auto id = symbols.getId(P4RuntimeSymbolType_Standard::DIRECT_METER(),
-                                    meterInstance.name);
-            meter->mutable_preamble()->set_id(id);
-            setMeterCommon(meter, meterInstance);
-            auto tableId = symbols.getId(P4RuntimeSymbolType::TABLE(), *meterInstance.table);
-            meter->set_direct_table_id(tableId);
-        } else {
-            auto meter = p4Info->add_meters();
-            auto id = symbols.getId(P4RuntimeSymbolType_Standard::METER(),
-                                    meterInstance.name);
-            meter->mutable_preamble()->set_id(id);
-            setMeterCommon(meter, meterInstance);
-            meter->set_size(meterInstance.size);
-        }
-    }
-
-    void addRegister(const Register& registerInstance) {
-        auto register_ = p4Info->add_registers();
-        auto id = symbols.getId(P4RuntimeSymbolType_Standard::REGISTER(),
-                                registerInstance.name);
-        register_->mutable_preamble()->set_id(id);
-        register_->mutable_preamble()->set_name(registerInstance.name);
-        register_->mutable_preamble()->set_alias(symbols.getAlias(registerInstance.name));
-        addAnnotations(register_->mutable_preamble(), registerInstance.annotations);
-        register_->set_size(registerInstance.size);
-        register_->mutable_type_spec()->CopyFrom(*registerInstance.typeSpec);
-    }
-
-    void addDigest(const Digest& digest) {
-        // Each call to digest() creates a new digest entry in the P4Info.
-        // Right now we only take the type of data included in the digest
-        // (encoded in its name) into account, but it may be that we should also
-        // consider the receiver.
-        auto id = symbols.getId(P4RuntimeSymbolType_Standard::DIGEST(), digest.name);
-        if (serializedInstances.find(id) != serializedInstances.end()) return;
-        serializedInstances.insert(id);
-
-        auto* digestInstance = p4Info->add_digests();
-        digestInstance->mutable_preamble()->set_id(id);
-        digestInstance->mutable_preamble()->set_name(digest.name);
-        digestInstance->mutable_preamble()->set_alias(symbols.getAlias(digest.name));
-        digestInstance->mutable_type_spec()->CopyFrom(*digest.typeSpec);
-    }
 
     void addAction(const IR::P4Action* actionDeclaration) {
         if (isHidden(actionDeclaration)) return;
@@ -1187,17 +1598,18 @@ class P4RuntimeAnalyzer {
         }
     }
 
-    void addTable(const IR::P4Table* tableDeclaration,
-                  uint64_t tableSize,
-                  const boost::optional<cstring>& implementation,
-                  const boost::optional<Counterlike<IR::Counter>>& directCounter,
-                  const boost::optional<Counterlike<IR::Meter>>& directMeter,
-                  const boost::optional<DefaultAction>& defaultAction,
-                  const std::vector<ActionRef>& actions,
-                  const std::vector<MatchField>& matchFields,
-                  bool supportsTimeout,
-                  bool isConstTable) {
+    void addTable(const IR::TableBlock* tableBlock) {
+        CHECK_NULL(tableBlock);
+
+        auto tableDeclaration = tableBlock->container;
         if (isHidden(tableDeclaration)) return;
+
+        auto tableSize = getTableSize(tableDeclaration);
+        auto defaultAction = getDefaultAction(tableDeclaration, refMap, typeMap);
+        auto matchFields = getMatchFields(tableDeclaration, refMap, typeMap);
+        auto actions = getActionRefs(tableDeclaration, refMap);
+
+        bool isConstTable = getConstTable(tableDeclaration);
 
         auto name = tableDeclaration->controlPlaneName();
         auto annotations = tableDeclaration->to<IR::IAnnotated>();
@@ -1208,26 +1620,6 @@ class P4RuntimeAnalyzer {
         table->mutable_preamble()->set_alias(symbols.getAlias(name));
         addAnnotations(table->mutable_preamble(), annotations);
         table->set_size(tableSize);
-
-        if (implementation) {
-            auto id =
-              symbols.getId(P4RuntimeSymbolType_Standard::ACTION_PROFILE(), *implementation);
-            table->set_implementation_id(id);
-        }
-
-        if (directCounter) {
-            auto id = symbols.getId(P4RuntimeSymbolType_Standard::DIRECT_COUNTER(),
-                                    directCounter->name);
-            table->add_direct_resource_ids(id);
-            addCounter(*directCounter);
-        }
-
-        if (directMeter) {
-            auto id = symbols.getId(P4RuntimeSymbolType_Standard::DIRECT_METER(),
-                                    directMeter->name);
-            table->add_direct_resource_ids(id);
-            addMeter(*directMeter);
-        }
 
         if (defaultAction && defaultAction->isConst) {
             auto id = symbols.getId(P4RuntimeSymbolType::ACTION(), defaultAction->name);
@@ -1256,34 +1648,39 @@ class P4RuntimeAnalyzer {
             match_field->set_match_type(field.type);
         }
 
-        if (supportsTimeout) {
-            table->set_idle_timeout_behavior(p4::config::Table::NOTIFY_CONTROL);
-        } else {
-            table->set_idle_timeout_behavior(p4::config::Table::NO_TIMEOUT);
-        }
-
         if (isConstTable) {
             table->set_is_const_table(true);
         }
+
+        archHandler->addTableProperties(symbols, p4Info, table, tableBlock);
     }
 
-    void addActionProfile(const ActionProfile& actionProfile,
-                          const std::set<cstring>& tables) {
-        auto profile = p4Info->add_action_profiles();
-        auto id = symbols.getId(P4RuntimeSymbolType_Standard::ACTION_PROFILE(),
-                                actionProfile.name);
-        profile->mutable_preamble()->set_id(id);
-        profile->mutable_preamble()->set_name(actionProfile.name);
-        profile->mutable_preamble()->set_alias(symbols.getAlias(actionProfile.name));
-        profile->set_with_selector(actionProfile.type
-                                     == ActionProfileType::INDIRECT_WITH_SELECTOR);
-        profile->set_size(actionProfile.size);
+    void addExtern(const IR::ExternBlock* externBlock) {
+        CHECK_NULL(externBlock);
+        archHandler->addExternInstance(symbols, p4Info, externBlock);
+    }
 
-        for (const auto& table : tables) {
-            profile->add_table_ids(symbols.getId(P4RuntimeSymbolType::TABLE(), table));
-        }
+    void analyzeControl(const IR::ControlBlock* controlBlock) {
+        CHECK_NULL(controlBlock);
 
-        addAnnotations(profile->mutable_preamble(), actionProfile.annotations);
+        auto control = controlBlock->container;
+        CHECK_NULL(control);
+
+        forAllMatching<IR::P4Action>(&control->controlLocals,
+                                     [&](const IR::P4Action* action) {
+            // Generate P4Info for the action and, implicitly, its parameters.
+            addAction(action);
+
+            // Generate P4Info for any extern functions it may invoke.
+            forAllMatching<IR::MethodCallExpression>(action->body,
+                                                     [&](const IR::MethodCallExpression* call) {
+                auto instance = P4::MethodInstance::resolve(call, refMap, typeMap);
+                if (instance->is<P4::ExternFunction>()) {
+                    archHandler->addExternFunction(
+                        symbols, p4Info, instance->to<P4::ExternFunction>());
+                }
+            });
+        });
     }
 
     void addValueSet(const IR::P4ValueSet* inst) {
@@ -1316,108 +1713,17 @@ class P4RuntimeAnalyzer {
     }
 
  private:
-    /// Serialize @annotated's P4 annotations and attach them to a P4Info message
-    /// with an 'annotations' field. '@name' and '@id' are ignored, as well as
-    /// annotations whose name satisfies predicate @p.
-    template <typename Message, typename UnaryPredicate>
-    static void addAnnotations(Message* message, const IR::IAnnotated* annotated,
-                               UnaryPredicate p) {
-        CHECK_NULL(message);
-
-        // Synthesized resources may have no annotations.
-        if (annotated == nullptr) return;
-
-        for (const IR::Annotation* annotation : annotated->getAnnotations()->annotations) {
-            // Don't output the @name or @id annotations; they're represented
-            // elsewhere in P4Info messages.
-            if (annotation->name == IR::Annotation::nameAnnotation) continue;
-            if (annotation->name == "id") continue;
-            if (p(annotation->name)) continue;
-
-            // Serialize the annotation.
-            // XXX(seth): Might be nice to do something better than rely on toString().
-            std::string serializedAnnotation = "@" + annotation->name + "(";
-            auto expressions = annotation->expr;
-            for (unsigned i = 0; i < expressions.size(); ++i) {
-                serializedAnnotation.append(expressions[i]->toString());
-                if (i + 1 < expressions.size()) serializedAnnotation.append(", ");
-            }
-            serializedAnnotation.append(")");
-
-            message->add_annotations(serializedAnnotation);
-        }
-    }
-
-    /// calls addAnnotations with a unconditionally false predicate.
-    template <typename Message>
-    static void addAnnotations(Message* message, const IR::IAnnotated* annotated) {
-        addAnnotations(message, annotated, [](cstring){ return false; });
-    }
-
     /// P4Runtime's representation of a program's control plane API.
     P4Info* p4Info;
     /// The symbols used in the API and their ids.
     const P4RuntimeSymbolTable& symbols;
     /// The actions we've serialized so far. Used for deduplication.
     std::set<p4rt_id_t> serializedActions;
-    /// The extern instances we've serialized so far. Used for deduplication.
-    std::set<p4rt_id_t> serializedInstances;
     /// Type information for the P4 program we're serializing.
     TypeMap* typeMap;
-    P4RuntimeArchHandlerIface* archHandler{nullptr};
+    ReferenceMap* refMap;
+    P4RuntimeArchHandlerIface* archHandler;
 };
-
-/// @return serialization information for the digest() call represented by
-/// @call, or boost::none if @call is not a digest() call or is invalid.
-static boost::optional<Digest>
-getDigestCall(const IR::MethodCallExpression* call,
-              ReferenceMap* refMap,
-              TypeMap* typeMap,
-              p4::P4TypeInfo* p4RtTypeInfo) {
-    auto instance = P4::MethodInstance::resolve(call, refMap, typeMap);
-    if (!instance->is<P4::ExternFunction>()) return boost::none;
-
-    auto function = instance->to<P4::ExternFunction>();
-    if (function->method->name != P4V1::V1Model::instance.digest_receiver.name)
-        return boost::none;
-
-    BUG_CHECK(call->typeArguments->size() == 1,
-              "%1%: Expected one type argument", call);
-    BUG_CHECK(call->arguments->size() == 2, "%1%: Expected 2 arguments", call);
-
-    // An invocation of digest() looks like this:
-    //   digest<T>(receiver, { fields });
-    // The name that shows up in the control plane API is the type name T. If T
-    // doesn't have a name (e.g. tuple), we auto-generate one; ideally we would
-    // be able to annotate the digest method call with a @name annotation in the
-    // P4 but annotations are not supported on expressions.
-    cstring controlPlaneName;
-    auto* typeArg = call->typeArguments->at(0);
-    if (typeArg->is<IR::Type_StructLike>()) {
-        auto structType = typeArg->to<IR::Type_StructLike>();
-        controlPlaneName = structType->controlPlaneName();
-    } else if (auto* typeName = typeArg->to<IR::Type_Name>()) {
-        auto* referencedType = refMap->getDeclaration(typeName->path, true);
-        CHECK_NULL(referencedType);
-        controlPlaneName = referencedType->controlPlaneName();
-    } else {
-        static std::unordered_map<const IR::MethodCallExpression*, cstring> autoNames;
-        auto it = autoNames.find(call);
-        if (it == autoNames.end()) {
-            controlPlaneName = "digest_" + cstring::to_cstring(autoNames.size());
-            ::warning("Cannot find a good name for %1% method call, using "
-                      "auto-generated name '%2%'", call, controlPlaneName);
-            autoNames.emplace(call, controlPlaneName);
-        } else {
-            controlPlaneName = it->second;
-        }
-    }
-
-    // Convert the generic type for the digest method call to a P4DataTypeSpec
-    auto* typeSpec = TypeSpecConverter::convert(typeMap, refMap, typeArg, p4RtTypeInfo);
-    BUG_CHECK(typeSpec != nullptr, "P4 type %1% could not be converted to P4Info P4DataTypeSpec");
-    return Digest{controlPlaneName, typeSpec};
-}
 
 static void collectControlSymbols(P4RuntimeSymbolTable& symbols,
                                   P4RuntimeArchHandlerIface* archHandler,
@@ -1442,34 +1748,6 @@ static void collectControlSymbols(P4RuntimeSymbolTable& symbols,
             auto instance = P4::MethodInstance::resolve(call, refMap, typeMap);
             if (instance->is<P4::ExternFunction>())
                 archHandler->collectExternFunction(&symbols, instance->to<P4::ExternFunction>());
-            // auto digest = getDigestCall(call, refMap, typeMap, nullptr);
-            // if (digest) symbols.add(P4RuntimeSymbolType_Standard::DIGEST(), digest->name);
-        });
-    });
-}
-
-static void analyzeControl(P4RuntimeAnalyzer& analyzer,
-                           const IR::ControlBlock* controlBlock,
-                           ReferenceMap* refMap,
-                           TypeMap* typeMap,
-                           p4::P4TypeInfo* p4RtTypeInfo) {
-    CHECK_NULL(controlBlock);
-    CHECK_NULL(refMap);
-    CHECK_NULL(typeMap);
-
-    auto control = controlBlock->container;
-    CHECK_NULL(control);
-
-    forAllMatching<IR::P4Action>(&control->controlLocals,
-                                 [&](const IR::P4Action* action) {
-        // Generate P4Info for the action and, implicitly, its parameters.
-        analyzer.addAction(action);
-
-        // Generate P4Info for any extern functions it may invoke.
-        forAllMatching<IR::MethodCallExpression>(action->body,
-                      [&](const IR::MethodCallExpression* call) {
-            auto digest = getDigestCall(call, refMap, typeMap, p4RtTypeInfo);
-            if (digest) analyzer.addDigest(*digest);
         });
     });
 }
@@ -1479,63 +1757,6 @@ static void collectExternSymbols(P4RuntimeSymbolTable& symbols,
                                  const IR::ExternBlock* externBlock) {
     CHECK_NULL(externBlock);
     archHandler->collectExternInstance(&symbols, externBlock);
-
-    // auto decl = externBlock->node->to<IR::IDeclaration>();
-    // if (decl == nullptr) return;
-
-    // if (externBlock->type->name == CounterlikeTraits<IR::Counter>::typeName()) {
-    //     symbols.add(P4RuntimeSymbolType_Standard::COUNTER(), decl);
-    // } else if (externBlock->type->name == CounterlikeTraits<IR::Meter>::typeName()) {
-    //     symbols.add(P4RuntimeSymbolType_Standard::METER(), decl);
-    // } else if (externBlock->type->name == P4V1::V1Model::instance.action_profile.name ||
-    //            externBlock->type->name == P4V1::V1Model::instance.action_selector.name) {
-    //     symbols.add(P4RuntimeSymbolType_Standard::ACTION_PROFILE(), decl);
-    // } else if (externBlock->type->name == P4V1::V1Model::instance.registers.name) {
-    //     symbols.add(P4RuntimeSymbolType_Standard::REGISTER(), decl);
-    // } else if (externBlock->type->name == "direct_counter") {
-    //     std::cout << "DIRECT COUNTER\n";
-    // }
-}
-
-static void analyzeExtern(P4RuntimeAnalyzer& analyzer,
-                          const IR::ExternBlock* externBlock,
-                          const ReferenceMap* refMap,
-                          const TypeMap* typeMap,
-                          p4::P4TypeInfo* p4RtTypeInfo) {
-    CHECK_NULL(externBlock);
-    CHECK_NULL(typeMap);
-
-    if (externBlock->type->name == CounterlikeTraits<IR::Counter>::typeName()) {
-        auto counter = Counterlike<IR::Counter>::from(externBlock);
-        if (counter) analyzer.addCounter(*counter);
-    } else if (externBlock->type->name == CounterlikeTraits<IR::Meter>::typeName()) {
-        auto meter = Counterlike<IR::Meter>::from(externBlock);
-        if (meter) analyzer.addMeter(*meter);
-    } else if (externBlock->type->name == P4V1::V1Model::instance.registers.name) {
-        auto register_ = Register::from(externBlock, refMap, typeMap, p4RtTypeInfo);
-        if (register_) analyzer.addRegister(*register_);
-    }
-}
-
-/// @return the table implementation property, or nullptr if the table has no
-/// such property.
-static const IR::Property *
-getTableImplementationProperty(const IR::P4Table* table) {
-    return table->properties->getProperty(
-        P4V1::V1Model::instance.tableAttributes.tableImplementation.name);
-}
-
-/// @return the direct counter associated with @table, if it has one, or
-/// boost::none otherwise.
-template <typename Kind>
-static boost::optional<Counterlike<Kind>>
-getDirectCounterlike(const IR::P4Table* table, ReferenceMap* refMap, TypeMap* typeMap) {
-    auto propertyName = CounterlikeTraits<Kind>::directPropertyName();
-    auto instance =
-      getExternInstanceFromProperty(table, propertyName, refMap, typeMap);
-    if (!instance) return boost::none;
-    std::cout << "GOT ONE\n";
-    return Counterlike<Kind>::fromDirect(*instance, table);
 }
 
 static void collectTableSymbols(P4RuntimeSymbolTable& symbols,
@@ -1547,39 +1768,6 @@ static void collectTableSymbols(P4RuntimeSymbolTable& symbols,
     auto table = tableBlock->container;
     symbols.add(P4RuntimeSymbolType::TABLE(), table);
     archHandler->collectTableProperties(&symbols, tableBlock);
-
-    // // If this table has an implementation property, it has an action profile.
-    // // We collect that symbol here as well, because in P4-16 action profiles are
-    // // just extern instantiations and aren't defined separately from the tables
-    // // that use them.
-    // auto impl = getTableImplementationProperty(table);
-    // if (impl) {
-    //     // we only collect the implementation symbol if the action profile is instantiated within
-    //     // the table declaration, otherwise the symbol is collected by collectExternSymbols.
-    //     if (!impl->value->is<IR::ExpressionValue>()) {
-    //         ::error("Expected implementation property value for table %1% to be an expression: %2%",
-    //                 table->controlPlaneName(), impl);
-    //         return;
-    //     }
-    //     auto expr = impl->value->to<IR::ExpressionValue>()->expression;
-    //     if (expr->is<IR::ConstructorCallExpression>()) {
-    //         symbols.add(P4RuntimeSymbolType_Standard::ACTION_PROFILE(),
-    //                     impl->controlPlaneName());
-    //     }
-    // }
-
-    // auto ap = getExternInstanceFromProperty(table, "implementation", refMap, typeMap);
-    // if (ap) std::cout << "ACTION PRO\n";
-
-    // auto directCounter = getDirectCounterlike<IR::Counter>(table, refMap, typeMap);
-    // if (directCounter) {
-    //     symbols.add(P4RuntimeSymbolType_Standard::DIRECT_COUNTER(), directCounter->name);
-    // }
-
-    // auto directMeter = getDirectCounterlike<IR::Meter>(table, refMap, typeMap);
-    // if (directMeter) {
-    //     symbols.add(P4RuntimeSymbolType_Standard::DIRECT_METER(), directMeter->name);
-    // }
 }
 
 static void collectParserSymbols(P4RuntimeSymbolTable& symbols,
@@ -1596,193 +1784,6 @@ static void collectParserSymbols(P4RuntimeSymbolTable& symbols,
     }
 }
 
-/// @return the header instance fields matched against by @table's key. The
-/// fields are represented as a (fully qualified field name, match type) tuple.
-static std::vector<MatchField>
-getMatchFields(const IR::P4Table* table, ReferenceMap* refMap, TypeMap* typeMap) {
-    std::vector<MatchField> matchFields;
-
-    auto key = table->getKey();
-    if (!key) return matchFields;
-
-    for (auto keyElement : key->keyElements) {
-        auto matchTypeDecl = refMap->getDeclaration(keyElement->matchType->path, true)
-                                   ->to<IR::Declaration_ID>();
-        BUG_CHECK(matchTypeDecl != nullptr, "No declaration for match type '%1%'",
-                                            keyElement->matchType);
-        const auto matchTypeName = matchTypeDecl->name.name;
-
-        MatchField::MatchType matchType;
-        if (matchTypeName == P4CoreLibrary::instance.exactMatch.name) {
-            matchType = MatchField::MatchTypes::EXACT;
-        } else if (matchTypeName == P4CoreLibrary::instance.lpmMatch.name) {
-            matchType = MatchField::MatchTypes::LPM;
-        } else if (matchTypeName == P4CoreLibrary::instance.ternaryMatch.name) {
-            matchType = MatchField::MatchTypes::TERNARY;
-        } else if (matchTypeName == P4V1::V1Model::instance.rangeMatchType.name) {
-            matchType = MatchField::MatchTypes::RANGE;
-        } else if (matchTypeName == P4V1::V1Model::instance.selectorMatchType.name) {
-            // This match type indicates that this table is using an action
-            // profile. We serialize action profiles separately from the tables
-            // themselves, so we don't need to record any information about this
-            // key, but it's worth doing a sanity check that this table has an
-            // implementation property - if it doesn't, analyzeActionProfiles()
-            // will ignore it.
-            auto impl = getTableImplementationProperty(table);
-            BUG_CHECK(impl != nullptr, "Table '%1%' has match type 'selector' "
-                                       "but no implementation property",
-                      table->controlPlaneName());
-            continue;
-        } else {
-            ::error("Table '%1%': cannot represent match type '%2%' in P4Runtime",
-                    table->controlPlaneName(), matchTypeName);
-            break;
-        }
-
-        auto matchFieldName = explicitNameAnnotation(keyElement);
-        BUG_CHECK(bool(matchFieldName), "Table '%1%': Match field '%2%' has no "
-                  "@name annotation", table->controlPlaneName(),
-                  keyElement->expression);
-        auto* matchFieldType =
-          typeMap->getType(keyElement->expression->getNode(), true);
-        BUG_CHECK(matchFieldType != nullptr,
-                  "Couldn't determine type for key element %1%", keyElement);
-
-        matchFields.push_back(MatchField{*matchFieldName, matchType,
-                                         uint32_t(matchFieldType->width_bits()),
-                                         keyElement->to<IR::IAnnotated>()});
-    }
-
-    return matchFields;
-}
-
-/// @return @table's default action, if it has one, or boost::none otherwise.
-static boost::optional<DefaultAction>
-getDefaultAction(const IR::P4Table* table, ReferenceMap* refMap, TypeMap* typeMap) {
-    auto defaultActionProperty =
-        table->properties->getProperty(IR::TableProperties::defaultActionPropertyName);
-    if (defaultActionProperty == nullptr) return boost::none;
-    if (!defaultActionProperty->value->is<IR::ExpressionValue>()) {
-        ::error("Expected an action: %1%", defaultActionProperty);
-        return boost::none;
-    }
-
-    auto expr =
-        defaultActionProperty->value->to<IR::ExpressionValue>()->expression;
-    cstring actionName;
-    if (expr->is<IR::PathExpression>()) {
-        auto decl = refMap->getDeclaration(expr->to<IR::PathExpression>()->path, true);
-        BUG_CHECK(decl->is<IR::P4Action>(), "Expected an action: %1%", expr);
-        actionName = decl->to<IR::P4Action>()->controlPlaneName();
-    } else if (expr->is<IR::MethodCallExpression>()) {
-        auto callExpr = expr->to<IR::MethodCallExpression>();
-        auto instance = P4::MethodInstance::resolve(callExpr, refMap, typeMap);
-        BUG_CHECK(instance->is<P4::ActionCall>(), "Expected an action: %1%", expr);
-        actionName = instance->to<P4::ActionCall>()->action->controlPlaneName();
-    } else {
-        ::error("Unexpected expression in default action for table %1%: %2%",
-                table->controlPlaneName(), expr);
-        return boost::none;
-    }
-
-    return DefaultAction{actionName, defaultActionProperty->isConstant};
-}
-
-/// @return true if @table's 'support_timeout' property exists and is true. This
-/// indicates that @table supports entry ageing.
-static bool getSupportsTimeout(const IR::P4Table* table) {
-    auto timeout = table->properties->getProperty(P4V1::V1Model::instance
-                                                    .tableAttributes
-                                                    .supportTimeout.name);
-    if (timeout == nullptr) return false;
-    if (!timeout->value->is<IR::ExpressionValue>()) {
-        ::error("Unexpected value %1% for supports_timeout on table %2%",
-                timeout, table);
-        return false;
-    }
-
-    auto expr = timeout->value->to<IR::ExpressionValue>()->expression;
-    if (!expr->is<IR::BoolLiteral>()) {
-        ::error("Unexpected non-boolean value %1% for supports_timeout "
-                "property on table %2%", timeout, table);
-        return false;
-    }
-
-    return expr->to<IR::BoolLiteral>()->value;
-}
-
-/// @return true if @table has a 'entries' property. The property must be const
-/// as per the current P4_16 specification. The frontend already enforces that
-/// check but we perform the check again here in case the constraint is relaxed
-/// in the specification in the future.
-static bool getConstTable(const IR::P4Table* table) {
-    BUG_CHECK(table != nullptr, "Failed precondition for getConstTable");
-    auto ep = table->properties->getProperty(IR::TableProperties::entriesPropertyName);
-    if (ep == nullptr) return false;
-    BUG_CHECK(ep->value->is<IR::EntriesList>(), "Invalid 'entries' property");
-    if (!ep->isConstant)
-        ::error("%1%: P4Runtime only supports constant table initializers", ep);
-    return true;
-}
-
-static std::vector<ActionRef>
-getActionRefs(const IR::P4Table* table, ReferenceMap* refMap) {
-    std::vector<ActionRef> actions;
-    for (auto action : table->getActionList()->actionList) {
-        auto decl = refMap->getDeclaration(action->getPath(), true);
-        BUG_CHECK(decl->is<IR::P4Action>(), "Not an action: '%1%'", decl);
-        auto name = decl->to<IR::P4Action>()->controlPlaneName();
-        // get annotations on the reference in the action list, not on the action declaration
-        auto annotations = action->to<IR::IAnnotated>();
-        actions.push_back(ActionRef{name, annotations});
-    }
-    return actions;
-}
-
-static boost::optional<cstring>
-getTableImplementationName(const IR::P4Table* table, ReferenceMap* refMap) {
-    auto impl = getTableImplementationProperty(table);
-    if (impl == nullptr) return boost::none;
-    if (!impl->value->is<IR::ExpressionValue>()) {
-        ::error("Expected implementation property value for table %1% to be an expression: %2%",
-                table->controlPlaneName(), impl);
-        return boost::none;
-    }
-    auto expr = impl->value->to<IR::ExpressionValue>()->expression;
-    if (expr->is<IR::ConstructorCallExpression>()) return impl->controlPlaneName();
-    if (expr->is<IR::PathExpression>()) {
-        auto decl = refMap->getDeclaration(expr->to<IR::PathExpression>()->path, true);
-        return decl->controlPlaneName();
-    }
-    return boost::none;
-}
-
-static void analyzeTable(P4RuntimeAnalyzer& analyzer,
-                         const IR::TableBlock* tableBlock,
-                         ReferenceMap* refMap,
-                         TypeMap* typeMap) {
-    CHECK_NULL(tableBlock);
-
-    auto table = tableBlock->container;
-    auto tableSize = getTableSize(table);
-    auto defaultAction = getDefaultAction(table, refMap, typeMap);
-    auto matchFields = getMatchFields(table, refMap, typeMap);
-    auto actions = getActionRefs(table, refMap);
-
-    auto implementation = getTableImplementationName(table, refMap);
-
-    auto directCounter = getDirectCounterlike<IR::Counter>(table, refMap, typeMap);
-    auto directMeter = getDirectCounterlike<IR::Meter>(table, refMap, typeMap);
-
-    bool supportsTimeout = getSupportsTimeout(table);
-
-    bool isConstTable = getConstTable(table);
-
-    analyzer.addTable(table, tableSize, implementation, directCounter,
-                      directMeter, defaultAction, actions, matchFields,
-                      supportsTimeout, isConstTable);
-}
-
 static void analyzeParser(P4RuntimeAnalyzer& analyzer,
                           const IR::ParserBlock* parserBlock) {
     CHECK_NULL(parserBlock);
@@ -1794,106 +1795,6 @@ static void analyzeParser(P4RuntimeAnalyzer& analyzer,
         if (auto inst = s->to<IR::P4ValueSet>()) {
             analyzer.addValueSet(inst);
         }
-    }
-}
-
-/// Visit evaluated blocks under the provided top-level block. Guarantees that
-/// each block is visited only once, even if multiple paths to reach it exist.
-template <typename Func>
-static void forAllEvaluatedBlocks(const IR::ToplevelBlock* aToplevelBlock,
-                                  Func function) {
-    std::set<const IR::Block*> visited;
-    ordered_set<const IR::Block*> frontier{aToplevelBlock};
-
-    while (!frontier.empty()) {
-        // Pop a block off the frontier of blocks we haven't yet visited.
-        auto evaluatedBlock = *frontier.begin();
-        frontier.erase(frontier.begin());
-        visited.insert(evaluatedBlock);
-
-        function(evaluatedBlock);
-
-        // Add child blocks to the frontier if we haven't already visited them.
-        for (auto evaluatedChild : evaluatedBlock->constantValue) {
-            if (!evaluatedChild.second->is<IR::Block>()) continue;
-            auto evaluatedChildBlock = evaluatedChild.second->to<IR::Block>();
-            if (visited.find(evaluatedChildBlock) != visited.end()) continue;
-            frontier.insert(evaluatedChildBlock);
-        }
-    }
-}
-
-static const IR::IAnnotated*
-getActionProfileAnnotations(const IR::P4Table* table, ReferenceMap* refMap) {
-    auto impl = getTableImplementationProperty(table);
-    if (impl == nullptr) return nullptr;
-    if (!impl->value->is<IR::ExpressionValue>()) return nullptr;
-    auto expr = impl->value->to<IR::ExpressionValue>()->expression;
-    if (expr->is<IR::ConstructorCallExpression>()) return impl->to<IR::IAnnotated>();
-    if (expr->is<IR::PathExpression>()) {
-        auto decl = refMap->getDeclaration(expr->to<IR::PathExpression>()->path, true);
-        return decl->to<IR::IAnnotated>();
-    }
-    return nullptr;
-}
-
-/// @return the action profile referenced in @table's implementation property,
-/// if it has one, or boost::none otherwise.
-static boost::optional<ActionProfile>
-getActionProfile(const IR::P4Table* table, ReferenceMap* refMap, TypeMap* typeMap) {
-    auto propertyName = P4V1::V1Model::instance.tableAttributes
-                                               .tableImplementation.name;
-    auto instance =
-      getExternInstanceFromProperty(table, propertyName, refMap, typeMap);
-    if (!instance) return boost::none;
-
-    ActionProfileType actionProfileType;
-    const IR::Expression* sizeExpression;
-    if (instance->type->name == P4V1::V1Model::instance.action_selector.name) {
-        actionProfileType = ActionProfileType::INDIRECT_WITH_SELECTOR;
-        sizeExpression = instance->arguments->at(1)->expression;
-    } else if (instance->type->name == P4V1::V1Model::instance.action_profile.name) {
-        actionProfileType = ActionProfileType::INDIRECT;
-        sizeExpression = instance->arguments->at(0)->expression;
-    } else {
-        ::error("Table '%1%' has an implementation which doesn't resolve to an "
-                "action profile: %2%", table->controlPlaneName(),
-                instance->expression);
-        return boost::none;
-    }
-
-    if (!sizeExpression->is<IR::Constant>()) {
-      ::error("Action profile '%1%' has non-constant size '%1%'",
-              *instance->name, sizeExpression);
-      return boost::none;
-    }
-
-    const int64_t size = sizeExpression->to<IR::Constant>()->asInt();
-    return ActionProfile{*instance->name, actionProfileType, size,
-                         getActionProfileAnnotations(table, refMap)};
-}
-
-static void analyzeActionProfiles(P4RuntimeAnalyzer& analyzer,
-                                  const IR::ToplevelBlock* aToplevelBlock,
-                                  ReferenceMap* refMap,
-                                  TypeMap* typeMap) {
-    std::map<ActionProfile, std::set<cstring>> actionProfiles;
-
-    // Collect all of the action profiles referenced in the program. The same
-    // action profile may be referenced by multiple tables.
-    forAllEvaluatedBlocks(aToplevelBlock, [&](const IR::Block* block) {
-        if (!block->is<IR::TableBlock>()) return;
-        auto table = block->to<IR::TableBlock>()->container;
-        auto actionProfile = getActionProfile(table, refMap, typeMap);
-        if (actionProfile) {
-            actionProfiles[*actionProfile].insert(table->controlPlaneName());
-        }
-    });
-
-    for (const auto& actionProfile : actionProfiles) {
-        const auto& profile = actionProfile.first;
-        const auto& tables = actionProfile.second;
-        analyzer.addActionProfile(profile, tables);
     }
 }
 
@@ -2157,22 +2058,21 @@ P4RuntimeAnalyzer::analyze(const IR::P4Program* program,
         });
     });
 
+    archHandler->postCollect(symbols, evaluatedProgram);
+
     // Construct a P4Runtime control plane API from the program.
-    P4RuntimeAnalyzer analyzer(symbols, typeMap);
+    P4RuntimeAnalyzer analyzer(symbols, typeMap, refMap, archHandler);
     forAllEvaluatedBlocks(evaluatedProgram, [&](const IR::Block* block) {
         if (block->is<IR::ControlBlock>()) {
-            analyzeControl(analyzer, block->to<IR::ControlBlock>(), refMap, typeMap,
-                           analyzer.p4Info->mutable_type_info());
+            analyzer.analyzeControl(block->to<IR::ControlBlock>());
         } else if (block->is<IR::ExternBlock>()) {
-            analyzeExtern(analyzer, block->to<IR::ExternBlock>(), refMap, typeMap,
-                          analyzer.p4Info->mutable_type_info());
+            analyzer.addExtern(block->to<IR::ExternBlock>());
         } else if (block->is<IR::TableBlock>()) {
-            analyzeTable(analyzer, block->to<IR::TableBlock>(), refMap, typeMap);
+            analyzer.addTable(block->to<IR::TableBlock>());
         } else if (block->is<IR::ParserBlock>()) {
             analyzeParser(analyzer, block->to<IR::ParserBlock>());
         }
     });
-    analyzeActionProfiles(analyzer, evaluatedProgram, refMap, typeMap);
     forAllMatching<IR::Type_Header>(program, [&](const IR::Type_Header* type) {
         if (isControllerHeader(type)) {
             analyzer.addControllerHeader(type);

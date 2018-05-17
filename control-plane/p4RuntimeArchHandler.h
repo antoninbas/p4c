@@ -105,6 +105,8 @@ class P4RuntimeArchHandlerIface {
                                        const IR::ExternBlock* externBlock) = 0;
     virtual void collectExternFunction(P4RuntimeSymbolTableIface* symbols,
                                        const P4::ExternFunction* externFunction) = 0;
+    virtual void postCollect(const P4RuntimeSymbolTableIface& symbols,
+                             const IR::ToplevelBlock* aToplevelBlock) = 0;
     virtual void addTableProperties(const P4RuntimeSymbolTableIface& symbols,
                                     p4::config::P4Info* p4info,
                                     p4::config::Table* table,
