@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "p4/config/p4info.pb.h"
 
+#include "frontends/p4/externInstance.h"
 #include "frontends/p4/methodInstance.h"
 #include "ir/ir.h"
 #include "lib/ordered_set.h"
@@ -108,8 +109,7 @@ class P4RuntimeArchHandlerIface {
                                        const IR::ExternBlock* externBlock) = 0;
     virtual void collectExternFunction(P4RuntimeSymbolTableIface* symbols,
                                        const P4::ExternFunction* externFunction) = 0;
-    virtual void postCollect(const P4RuntimeSymbolTableIface& symbols,
-                             const IR::ToplevelBlock* aToplevelBlock) = 0;
+    virtual void postCollect(const P4RuntimeSymbolTableIface& symbols) = 0;
     virtual void addTableProperties(const P4RuntimeSymbolTableIface& symbols,
                                     p4::config::P4Info* p4info,
                                     p4::config::Table* table,
@@ -127,7 +127,8 @@ struct P4RuntimeArchHandlerBuilder {
 
     virtual P4RuntimeArchHandlerIface* operator()(
         ReferenceMap* refMap,
-        TypeMap* typeMap) const = 0;
+        TypeMap* typeMap,
+        const IR::ToplevelBlock* evaluatedProgram) const = 0;
 };
 
 namespace Helpers {
@@ -140,6 +141,9 @@ getExternInstanceFromProperty(const IR::P4Table* table,
                               ReferenceMap* refMap,
                               TypeMap* typeMap,
                               bool *isConstructedInPlace = nullptr);
+
+bool isExternPropertyConstructedInPlace(const IR::P4Table* table,
+                                        const cstring& propertyName);
 
 /// Visit evaluated blocks under the provided top-level block. Guarantees that
 /// each block is visited only once, even if multiple paths to reach it exist.
@@ -311,7 +315,9 @@ namespace Standard {
 
 struct V1ModelArchHandlerBuilder : public P4RuntimeArchHandlerBuilder {
     P4RuntimeArchHandlerIface* operator()(
-        ReferenceMap* refMap, TypeMap* typeMap) const override;
+        ReferenceMap* refMap,
+        TypeMap* typeMap,
+        const IR::ToplevelBlock* evaluatedProgram) const override;
 };
 
 }  // namespace Standard

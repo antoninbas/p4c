@@ -64,6 +64,20 @@ getExternInstanceFromProperty(const IR::P4Table* table,
     return externInstance;
 }
 
+bool isExternPropertyConstructedInPlace(const IR::P4Table* table,
+                                        const cstring& propertyName) {
+    auto property = table->properties->getProperty(propertyName);
+    if (property == nullptr) return false;
+    if (!property->value->is<IR::ExpressionValue>()) {
+        ::error("Expected %1% property value for table %2% to be an expression: %3%",
+                propertyName, table->controlPlaneName(), property);
+        return false;
+    }
+
+    auto expr = property->value->to<IR::ExpressionValue>()->expression;
+    return expr->is<IR::ConstructorCallExpression>();
+}
+
 /// @return @table's size property if available, falling back to the default size.
 int64_t getTableSize(const IR::P4Table* table) {
     const int64_t defaultTableSize =

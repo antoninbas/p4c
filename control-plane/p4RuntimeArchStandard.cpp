@@ -103,11 +103,6 @@ class SymbolType : public P4RuntimeSymbolType {
 
 /// The information about a digest call which is needed to serialize it.
 struct Digest {
-    struct Field {
-        const cstring name;       // The name of a field included in the digest.
-        const uint32_t bitwidth;  // How wide the field is.
-    };
-
     const cstring name;       // The fully qualified external name of the digest
                               // *data* - in P4-14, the field list name, or in
                               // P4-16, the type of the 'data' parameter.
@@ -181,15 +176,17 @@ struct ActionProfile {
     }
 };
 
-class P4RuntimeArchHandlerV1Model : public P4RuntimeArchHandlerIface {
+class P4RuntimeArchHandlerV1Model final : public P4RuntimeArchHandlerIface {
  public:
     using Counter = ::p4::config::Counter;
     using Meter = ::p4::config::Meter;
     using CounterSpec = ::p4::config::CounterSpec;
     using MeterSpec = ::p4::config::MeterSpec;
 
-    P4RuntimeArchHandlerV1Model(ReferenceMap* refMap,TypeMap* typeMap)
-        : refMap(refMap), typeMap(typeMap) { }
+    P4RuntimeArchHandlerV1Model(ReferenceMap* refMap,
+                                TypeMap* typeMap,
+                                const IR::ToplevelBlock* evaluatedProgram)
+        : refMap(refMap), typeMap(typeMap), evaluatedProgram(evaluatedProgram) { }
 
     void collectTableProperties(P4RuntimeSymbolTableIface* symbols,
                                 const IR::TableBlock* tableBlock) override {
@@ -275,12 +272,11 @@ class P4RuntimeArchHandlerV1Model : public P4RuntimeArchHandlerIface {
         if (digest) symbols->add(SymbolType::DIGEST(), digest->name);
     }
 
-    void postCollect(const P4RuntimeSymbolTableIface& symbols,
-                     const IR::ToplevelBlock* aToplevelBlock) override {
+    void postCollect(const P4RuntimeSymbolTableIface& symbols) override {
         (void)symbols;
         // analyze action profiles and build a mapping from action profile name to the set of tables
         // referencing them
-        Helpers::forAllEvaluatedBlocks(aToplevelBlock, [&](const IR::Block* block) {
+        Helpers::forAllEvaluatedBlocks(evaluatedProgram, [&](const IR::Block* block) {
             if (!block->is<IR::TableBlock>()) return;
             auto table = block->to<IR::TableBlock>()->container;
             auto implementation = getTableImplementationName(table, refMap);
@@ -296,6 +292,8 @@ class P4RuntimeArchHandlerV1Model : public P4RuntimeArchHandlerIface {
         CHECK_NULL(tableBlock);
         auto tableDeclaration = tableBlock->container;
 
+        using Helpers::isExternPropertyConstructedInPlace;
+
         auto implementation = getActionProfile(tableDeclaration, refMap, typeMap);
         auto directCounter = Helpers::getDirectCounterlike<CounterExtern>(
             tableDeclaration, refMap, typeMap);
@@ -307,13 +305,19 @@ class P4RuntimeArchHandlerV1Model : public P4RuntimeArchHandlerIface {
             auto id = symbols.getId(SymbolType::ACTION_PROFILE(),
                                     implementation->name);
             table->set_implementation_id(id);
-            addActionProfile(symbols, p4info, *implementation);
+            auto propertyName = P4V1::V1Model::instance.tableAttributes.tableImplementation.name;
+            if (isExternPropertyConstructedInPlace(tableDeclaration, propertyName))
+                addActionProfile(symbols, p4info, *implementation);
         }
 
         if (directCounter) {
             auto id = symbols.getId(SymbolType::DIRECT_COUNTER(),
                                     directCounter->name);
             table->add_direct_resource_ids(id);
+            // no risk to add twice because direct counters cannot be shared
+            // auto propertyName = P4V1::V1Model::instance.tableAttributes.counters.name;
+            // if (isExternPropertyConstructedInPlace(tableDeclaration, propertyName))
+            //     addCounter(symbols, p4info, *directCounter);
             addCounter(symbols, p4info, *directCounter);
         }
 
@@ -321,6 +325,10 @@ class P4RuntimeArchHandlerV1Model : public P4RuntimeArchHandlerIface {
             auto id = symbols.getId(SymbolType::DIRECT_METER(),
                                     directMeter->name);
             table->add_direct_resource_ids(id);
+            // no risk to add twice because direct meters cannot be shared
+            // auto propertyName = P4V1::V1Model::instance.tableAttributes.meters.name;
+            // if (isExternPropertyConstructedInPlace(tableDeclaration, propertyName))
+            //     addMeter(symbols, p4info, *directMeter);
             addMeter(symbols, p4info, *directMeter);
         }
 
@@ -656,6 +664,7 @@ class P4RuntimeArchHandlerV1Model : public P4RuntimeArchHandlerIface {
 
     ReferenceMap* refMap;
     TypeMap* typeMap;
+    const IR::ToplevelBlock* evaluatedProgram;
 
     std::unordered_map<cstring, std::set<cstring> > actionProfilesRefs;
 
@@ -664,8 +673,9 @@ class P4RuntimeArchHandlerV1Model : public P4RuntimeArchHandlerIface {
 };
 
 P4RuntimeArchHandlerIface*
-V1ModelArchHandlerBuilder::operator()(ReferenceMap* refMap, TypeMap* typeMap) const {
-    return new P4RuntimeArchHandlerV1Model(refMap, typeMap);
+V1ModelArchHandlerBuilder::operator()(
+    ReferenceMap* refMap, TypeMap* typeMap, const IR::ToplevelBlock* evaluatedProgram) const {
+    return new P4RuntimeArchHandlerV1Model(refMap, typeMap, evaluatedProgram);
 }
 
 }  // namespace Standard

@@ -1248,7 +1248,7 @@ P4RuntimeAnalyzer::analyze(const IR::P4Program* program,
         });
     });
 
-    archHandler->postCollect(symbols, evaluatedProgram);
+    archHandler->postCollect(symbols);
 
     // Construct a P4Runtime control plane API from the program.
     P4RuntimeAnalyzer analyzer(symbols, typeMap, refMap, archHandler);
@@ -1318,7 +1318,7 @@ P4RuntimeSerializer::generateP4Runtime(const IR::P4Program* program, cstring arc
               "Failed to transform the program into a "
               "P4Runtime-compatible form");
 
-    auto archHandler = (*archHandlerBuilderIt->second)(&refMap, &typeMap);
+    auto archHandler = (*archHandlerBuilderIt->second)(&refMap, &typeMap, evaluatedProgram);
 
     return P4RuntimeAnalyzer::analyze(p4RuntimeProgram, evaluatedProgram,
                                       &refMap, &typeMap, archHandler);
