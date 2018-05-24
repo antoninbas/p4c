@@ -76,7 +76,10 @@ class P4RuntimeSerializer {
     P4RuntimeAPI generateP4Runtime(const IR::P4Program* program, cstring arch);
 
     void serializeP4RuntimeIfRequired(const IR::P4Program* program,
-                                      const CompilerOptions& options); 
+                                      const CompilerOptions& options);
+
+    static cstring resolveArch(const CompilerOptions& options);
+
  private:
     P4RuntimeSerializer();
 

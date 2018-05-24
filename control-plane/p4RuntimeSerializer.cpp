@@ -1371,10 +1371,12 @@ P4RuntimeSerializer::serializeP4RuntimeIfRequired(const IR::P4Program* program,
     // '--p4runtime-entries-file' is used without '--p4runtime-file'.
     if (options.p4RuntimeFile.isNullOrEmpty()) return;
 
-    if (Log::verbose())
-        std::cout << "Generating P4Runtime output" << std::endl;
+    auto arch = P4RuntimeSerializer::resolveArch(options);
 
-    auto p4Runtime = get()->generateP4Runtime(program, "v1model");
+    if (Log::verbose())
+        std::cout << "Generating P4Runtime output for architecture " << arch << std::endl;
+
+    auto p4Runtime = get()->generateP4Runtime(program, arch);
 
     std::ostream* out = openFile(options.p4RuntimeFile, false);
     if (!out) {
@@ -1402,6 +1404,17 @@ P4RuntimeSerializer*
 P4RuntimeSerializer::get() {
     static P4RuntimeSerializer instance;
     return &instance;
+}
+
+cstring
+P4RuntimeSerializer::resolveArch(const CompilerOptions& options) {
+    if (auto arch = getenv("P4C_DEFAULT_ARCH")) {
+        return cstring(arch);
+    } else if (options.arch != "") {
+        return options.arch;
+    } else {
+        return "v1model";
+    }
 }
 
 void
