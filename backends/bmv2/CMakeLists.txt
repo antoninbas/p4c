@@ -19,6 +19,8 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/simple_switch/version.h.cmake"
   "${CMAKE_CURRENT_BINARY_DIR}/simple_switch/version.h" @ONLY)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/psa_switch/version.h.cmake"
   "${CMAKE_CURRENT_BINARY_DIR}/psa_switch/version.h" @ONLY)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/dpdk_switch/version.h.cmake"
+  "${CMAKE_CURRENT_BINARY_DIR}/dpdk_switch/version.h" @ONLY)
 
 # sources for backend executable
 set (BMV2_SIMPLE_SWITCH_SRCS
@@ -38,6 +40,15 @@ set (BMV2_PSA_SWITCH_SRCS
     psa_switch/psaSwitch.h
     )
 add_cpplint_files (${CMAKE_CURRENT_SOURCE_DIR} "${BMV2_PSA_SWITCH_SRCS}")
+
+set (BMV2_DPDK_SWITCH_SRCS
+    dpdk_switch/main.cpp
+    dpdk_switch/midend.cpp
+    dpdk_switch/midend.h
+    dpdk_switch/dpdkSwitch.cpp
+    dpdk_switch/dpdkSwitch.h
+    )
+add_cpplint_files (${CMAKE_CURRENT_SOURCE_DIR} "${BMV2_DPDK_SWITCH_SRCS}")
 
 set (BMV2_BACKEND_COMMON_SRCS
   common/JsonObjects.cpp
@@ -86,16 +97,21 @@ build_unified(BMV2_BACKEND_COMMON_SRCS)
 add_library(bmv2backend ${BMV2_BACKEND_COMMON_SRCS})
 add_dependencies(bmv2backend genIR frontend)
 
-build_unified(BMV2_SIMPLE_SWiTCH_SRCS)
+build_unified(BMV2_SIMPLE_SWITCH_SRCS)
 add_executable(p4c-bm2-ss ${BMV2_SIMPLE_SWITCH_SRCS})
 target_link_libraries (p4c-bm2-ss bmv2backend ${P4C_LIBRARIES} ${P4C_LIB_DEPS})
 
 install(TARGETS p4c-bm2-ss RUNTIME DESTINATION ${P4C_RUNTIME_OUTPUT_DIRECTORY})
 
-build_unified(BMV2_PSA_SWiTCH_SRCS)
+build_unified(BMV2_PSA_SWITCH_SRCS)
 add_executable(p4c-bm2-psa ${BMV2_PSA_SWITCH_SRCS})
 target_link_libraries (p4c-bm2-psa bmv2backend ${P4C_LIBRARIES} ${P4C_LIB_DEPS})
 install(TARGETS p4c-bm2-psa RUNTIME DESTINATION ${P4C_RUNTIME_OUTPUT_DIRECTORY})
+
+build_unified(BMV2_DPDK_SWITCH_SRCS)
+add_executable(p4c-bm2-dpdk ${BMV2_DPDK_SWITCH_SRCS})
+target_link_libraries (p4c-bm2-dpdk bmv2backend ${P4C_LIBRARIES} ${P4C_LIB_DEPS})
+install(TARGETS p4c-bm2-dpdk RUNTIME DESTINATION ${P4C_RUNTIME_OUTPUT_DIRECTORY})
 
 # hack to get around the fact that the test scripts expect the backend
 # binary to be in the top level directory. This should go away when we
@@ -103,6 +119,7 @@ install(TARGETS p4c-bm2-psa RUNTIME DESTINATION ${P4C_RUNTIME_OUTPUT_DIRECTORY})
 add_custom_target(linkbmv2
   COMMAND ${CMAKE_COMMAND} -E create_symlink ${CMAKE_CURRENT_BINARY_DIR}/p4c-bm2-ss ${P4C_BINARY_DIR}/p4c-bm2-ss
   COMMAND ${CMAKE_COMMAND} -E create_symlink ${CMAKE_CURRENT_BINARY_DIR}/p4c-bm2-psa ${P4C_BINARY_DIR}/p4c-bm2-psa
+  COMMAND ${CMAKE_COMMAND} -E create_symlink ${CMAKE_CURRENT_BINARY_DIR}/p4c-bm2-dpdk ${P4C_BINARY_DIR}/p4c-bm2-dpdk
   COMMAND ${CMAKE_COMMAND} -E create_symlink ${P4C_BINARY_DIR}/p4include ${CMAKE_CURRENT_BINARY_DIR}/p4include
   COMMAND ${CMAKE_COMMAND} -E create_symlink ${P4C_BINARY_DIR}/p4_14include ${CMAKE_CURRENT_BINARY_DIR}/p4_14include
   )

@@ -119,7 +119,7 @@ class BuildResourceMap : public Inspector {
 
     bool preorder(const IR::PackageBlock* package) override {
         for (auto cv : package->constantValue) {
-            if (cv.second->is<IR::Block>()) {
+            if (cv.second && cv.second->is<IR::Block>()) {
                 visit(cv.second->getNode()); } }
         return false;
     }
