@@ -18,6 +18,7 @@ limitations under the License.
 #define BACKENDS_BMV2_COMMON_ANNOTATIONS_H_
 
 #include "ir/ir.h"
+#include "lib/json.h"
 #include "frontends/p4/parseAnnotations.h"
 
 namespace BMV2 {
@@ -33,6 +34,8 @@ class ParseAnnotations : public P4::ParseAnnotations {
                 PARSE("priority", Constant)
             }) { }
 };
+
+void addAnnotations(Util::JsonObject* jObject, const IR::IAnnotated* annotated);
 
 }  // namespace BMV2
 

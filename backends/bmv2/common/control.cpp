@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#include "annotations.h"
 #include "control.h"
 #include "extern.h"
 #include "sharedActionSelectorCheck.h"
@@ -641,7 +642,11 @@ ControlConverter::convertTable(const CFG::TableNode* node,
         entry->emplace("action_entry_const", defact->isConstant);
         result->emplace("default_entry", entry);
     }
+
     convertTableEntries(table, result);
+
+    addAnnotations(result, table);
+
     return result;
 }
 
