@@ -1660,6 +1660,36 @@ TEST_F(P4RuntimeDataTypeSpec, Enum) {
     EXPECT_EQ("MBR_2", it->second.members(1).name());
 }
 
+// Currently throws an exception:
+// C++ exception with description "In file: /home/abas/p4lang/p4c/frontends/p4/typeChecking/typeChecker.cpp:144
+// Compiler Bug: At this point in the compilation typechecking should not infer new types anymore, but it did.
+// " thrown in the test body.
+// Remove DISABLED_ prefix once the issue is resolved.
+TEST_F(P4RuntimeDataTypeSpec, DISABLED_SerEnum) {
+    std::string program = P4_SOURCE(R"(
+        enum bit<8> my_enum { MBR_1 = 1, MBR_2 = 2}
+        extern my_extern_t<T> { my_extern_t(bit<32> v); }
+        my_extern_t<my_enum>(32w1024) my_extern;
+    )");
+    auto pgm = getProgram(program);
+    ASSERT_TRUE(pgm != nullptr && ::errorCount() == 0);
+
+    auto type = findExternTypeParameterName<IR::Type_Name>(pgm, "my_extern_t");
+    ASSERT_TRUE(type != nullptr);
+    auto typeSpec = P4::ControlPlaneAPI::TypeSpecConverter::convert(
+        &refMap, &typeMap, type, &typeInfo);
+    ASSERT_TRUE(typeSpec->has_serializable_enum());
+    EXPECT_EQ("my_enum", typeSpec->serializable_enum().name());
+
+    auto it = typeInfo.serializable_enums().find("my_enum");
+    ASSERT_TRUE(it != typeInfo.serializable_enums().end());
+    ASSERT_EQ(2, it->second.members_size());
+    EXPECT_EQ("MBR_1", it->second.members(0).name());
+    EXPECT_EQ("/x01", it->second.members(0).value());
+    EXPECT_EQ("MBR_2", it->second.members(1).name());
+    EXPECT_EQ("/x02", it->second.members(1).value());
+}
+
 TEST_F(P4RuntimeDataTypeSpec, Error) {
     std::string program = P4_SOURCE(R"(
         error { MBR_1, MBR_2 }
