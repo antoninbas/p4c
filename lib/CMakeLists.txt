@@ -19,7 +19,6 @@ set (LIBP4CTOOLKIT_SRCS
 	crash.cpp
 	cstring.cpp
         error_catalog.cpp
-        exename.cpp
 	gc.cpp
 	gmputil.cpp
 	hash.cpp
@@ -50,7 +49,6 @@ set (LIBP4CTOOLKIT_HDRS
         error_helper.h
 	error_reporter.h
 	exceptions.h
-        exename.h
 	gc.h
 	gmputil.h
 	hash.h
