@@ -23,6 +23,8 @@ limitations under the License.
 #include "crash.h"
 
 void backtrace_fill_stacktrace(std::string &msg, void *const*backtrace, int size) {
+  // backtrace_symbols is only available with libexecinfo
+#if HAVE_EXECINFO_H
     char **strings = backtrace_symbols(backtrace, size);
     for (int i = 0; i < size; i++) {
         if (strings) {
@@ -32,6 +34,12 @@ void backtrace_fill_stacktrace(std::string &msg, void *const*backtrace, int size
             msg += "\n    ";
             msg += line; } }
     free(strings);
+#else
+    // unused
+    (void)msg;
+    (void)backtrace;
+    (void)size;
+#endif
 }
 
 #ifdef __GLIBC__
